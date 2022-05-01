@@ -4,9 +4,6 @@ import (
 	"bufio"
 	"crypto"
 	"crypto/ed25519"
-	"crypto/rsa"
-	"crypto/x509"
-	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
@@ -49,7 +46,10 @@ var mutex = &sync.Mutex{}
 
 // validators keeps track of open validators and balances
 var validators = make(map[string]int)
+var validatorsConn = make(map[int]net.Conn)
 var validatorsList = make(map[string]interface{})
+
+var privKey string
 
 func ping() string {
 	return "pong"
@@ -69,56 +69,154 @@ func contains(s []string, str string) bool {
 	return false
 }
 
+func getConn(addr string, stype string) (net.Conn, error) {
+	conn, err := net.Dial("tcp", addr)
+	if stype == "origin" && err != nil {
+		fmt.Println("INITIAL NODE OFFLINE:", err)
+		fmt.Println("Server type is origin, ignoring")
+	}
+	return conn, err
+}
+
+func registerNodes(validators interface{}, stype string, tcpPort string, pu string, pk string) {
+	var nvalidators = make(map[string]interface{})
+	for _, v := range validators.(map[string]interface{}) {
+		md, _ := v.(map[string]interface{})
+		fmt.Println(md["IP"].(string) + ":" + md["PORT"].(string))
+		c, err := getConn(md["IP"].(string)+":"+md["PORT"].(string), stype)
+		if err != nil {
+			fmt.Println("Validator ("+md["PUBKEY"].(string)+") offline:", err)
+		} else {
+			fmt.Fprintf(c, "REGISTER_VALIDATOR::0.0.0.0::"+tcpPort+"::"+pu+"::"+signMessage(pu, pk)+"\n")
+			raw, _ := bufio.NewReader(c).ReadString('\n')
+			message := strings.Split(raw, "\n")[0]
+			if message == "VALIDATOR_REGISTERED" {
+				fmt.Fprintf(c, "GET_KNOWN_VALIDATORS\n")
+				raw, _ := bufio.NewReader(c).ReadString('\n')
+				message := strings.Split(raw, "\n")[0]
+				var nv interface{}
+				var tnv = make(map[string]interface{})
+				json.Unmarshal([]byte(message), &nv)
+				for _, v := range nv.(map[string]interface{}) {
+					md, _ := v.(map[string]interface{})
+					keys := make([]string, 0, len(validatorsList))
+					for k := range validatorsList {
+						keys = append(keys, k)
+					}
+					if !contains(keys, md["PUBKEY"].(string)) {
+						validatorsConn[len(validatorsConn)] = c
+						validatorsList[message] = map[string]interface{}{
+							"IP":     md["IP"].(string),
+							"PORT":   md["PORT"].(string),
+							"PUBKEY": message,
+						}
+						tnv[message] = map[string]interface{}{
+							"IP":     md["IP"].(string),
+							"PORT":   md["PORT"].(string),
+							"PUBKEY": message,
+						}
+						um, _ := json.Marshal(nvalidators)
+						json.Unmarshal([]byte(um), &nvalidators)
+					}
+				}
+			}
+		}
+	}
+	if len(nvalidators) > 0 {
+		registerNodes(nvalidators, stype, tcpPort, pu, pk)
+	}
+}
+
 func main() {
-	pu, pk := genKeypair("apapi")
+	pu, pk := genKeypair()
 	fmt.Println(pu)
 	fmt.Println(getPublicFromPrivate(pk))
 	fmt.Println(pk)
+
+	privKey = pk
 
 	err := godotenv.Load()
 	if err != nil {
 		log.Fatal(err)
 	}
-
-	// create genesis block
-	t := time.Now().Unix()
-	genesisBlock := Block{}
-	var result map[string]interface{}
-	json.Unmarshal([]byte("{}"), &result)
-	genesisBlock = Block{0, t, result, calculateBlockHash(genesisBlock), "", ""}
-	spew.Dump(genesisBlock)
-	Blockchain = append(Blockchain, genesisBlock)
-
 	tcpPort := os.Getenv("PORT")
+	stype := os.Getenv("TYPE")
 
-	// start TCP and serve TCP server
-	server, err := net.Listen("tcp", ":"+tcpPort)
-	if err != nil {
-		log.Fatal(err)
-	}
-	log.Println("TCP Server Listening on port", tcpPort)
-	defer server.Close()
+	originAddr := "localhost:8080"
 
-	go func() {
-		for candidate := range candidateBlocks {
-			mutex.Lock()
-			tempBlocks = append(tempBlocks, candidate)
-			mutex.Unlock()
+	c, err := getConn(originAddr, stype)
+
+	if stype != "origin" && err != nil {
+		log.Fatal("INITIAL NODE OFFLINE:", err)
+	} else {
+		if stype != "origin" {
+			fmt.Fprintf(c, "REGISTER_VALIDATOR::0.0.0.0::"+tcpPort+"::"+pu+"::"+signMessage(pu, pk)+"\n")
+
+			raw, _ := bufio.NewReader(c).ReadString('\n')
+			message := strings.Split(raw, "\n")[0]
+			if message == "VALIDATOR_REGISTERED" {
+				fmt.Fprintf(c, "GET_PUBKEY\n")
+				raw, _ := bufio.NewReader(c).ReadString('\n')
+				message := strings.Split(raw, "\n")[0]
+				validatorsConn[len(validatorsConn)] = c
+				validatorsList[message] = map[string]interface{}{
+					"IP":     strings.Split(originAddr, ":")[0],
+					"PORT":   strings.Split(originAddr, ":")[1],
+					"PUBKEY": message,
+				}
+				fmt.Println("Validator registered with initial node")
+				fmt.Println("Getting validators list")
+				fmt.Fprintf(c, "GET_KNOWN_VALIDATORS\n")
+				raw, _ = bufio.NewReader(c).ReadString('\n')
+				message = strings.Split(raw, "\n")[0]
+				var validators interface{}
+				json.Unmarshal([]byte(message), &validators)
+				registerNodes(validators, stype, tcpPort, pu, pk)
+			} else {
+				fmt.Println("Error registering validator")
+				return
+			}
+			fmt.Println("Finished registering with peer nodes")
 		}
-	}()
 
-	go func() {
-		for {
-			pickWinner()
-		}
-	}()
+		// create genesis block
+		t := time.Now().Unix()
+		genesisBlock := Block{}
+		var result map[string]interface{}
+		json.Unmarshal([]byte("{}"), &result)
+		genesisBlock = Block{0, t, result, calculateBlockHash(genesisBlock), "", ""}
+		spew.Dump(genesisBlock)
+		Blockchain = append(Blockchain, genesisBlock)
 
-	for {
-		conn, err := server.Accept()
+		// start TCP and serve TCP server
+		server, err := net.Listen("tcp", ":"+tcpPort)
 		if err != nil {
 			log.Fatal(err)
 		}
-		go handleConn(conn)
+		log.Println("TCP Server Listening on port", tcpPort)
+		defer server.Close()
+
+		go func() {
+			for candidate := range candidateBlocks {
+				mutex.Lock()
+				tempBlocks = append(tempBlocks, candidate)
+				mutex.Unlock()
+			}
+		}()
+
+		go func() {
+			for {
+				pickWinner()
+			}
+		}()
+
+		for {
+			conn, err := server.Accept()
+			if err != nil {
+				log.Fatal(err)
+			}
+			go handleConn(conn)
+		}
 	}
 }
 
@@ -184,6 +282,17 @@ func pickWinner() {
 	mutex.Unlock()
 }
 
+func verifyMessage(sig string, message string, publicKeyStr string) bool {
+	publicKey := base58.Decode(string(base58.Decode(publicKeyStr)))
+	return ed25519.Verify(publicKey, []byte(message), base58.Decode(sig))
+}
+
+func signMessage(message string, privateKey string) string {
+	_, priv, _ := ed25519.GenerateKey(strings.NewReader(string(base58.Decode(string(base58.Decode(privateKey))))))
+	signature := ed25519.Sign(priv, []byte(message))
+	return base58.Encode(signature)
+}
+
 func getPublicFromPrivate(privateKey string) string {
 	pubKey, _, _ := ed25519.GenerateKey(strings.NewReader(string(base58.Decode(string(base58.Decode(privateKey))))))
 	return base58.Encode([]byte(base58.Encode(pubKey)))
@@ -241,56 +350,29 @@ func handleConn(conn net.Conn) {
 			}
 			io.WriteString(conn, string(netData)+"\n")
 		} else if strings.Split(temp, "::")[0] == "REGISTER_VALIDATOR" {
-			if len(strings.Split(temp, "::")) == 6 {
+			if len(strings.Split(temp, "::")) == 5 {
 				validatorIP := strings.Split(temp, "::")[1]
 				validatorPORT := strings.Split(temp, "::")[2]
 				validatorKEY := strings.Split(temp, "::")[3]
 				validatorSIGNATURE := strings.Split(temp, "::")[4]
-				validatorPUBKEY := strings.Split(temp, "::")[5]
 
-				fmt.Println(validatorPUBKEY)
-
-				key, err := x509.ParsePKIXPublicKey([]byte(validatorPUBKEY))
-
-				if err != nil {
-					io.WriteString(conn, "ERROR::"+err.Error()+"\n")
+				if !verifyMessage(validatorSIGNATURE, validatorKEY, validatorKEY) {
+					io.WriteString(conn, "ERROR::INVALID_SIGNATURE\n")
 				} else {
-					pubKey := key.(*rsa.PublicKey)
-
-					signature, err := base64.StdEncoding.DecodeString(validatorSIGNATURE)
-
-					if err != nil {
-						io.WriteString(conn, "ERROR::INVALID_SIGNATURE\n")
-					} else {
-						hash := calculateHashBin(validatorKEY)
-						err := rsa.VerifyPKCS1v15(pubKey, crypto.SHA256, hash, signature)
-
-						if err != nil {
-							io.WriteString(conn, "ERROR::INVALID_SIGNATURE\n")
-						} else {
-							avalidators := make([]string, 0, len(validators))
-							for k := range validators {
-								avalidators = append(avalidators, string(k))
-							}
-
-							if contains(avalidators, validatorKEY) {
-								io.WriteString(conn, "VALIDATOR_ALREADY_REGISTERED\n")
-								continue
-							} else {
-								validatorsList[validatorKEY] = map[string]interface{}{
-									"IP":     validatorIP,
-									"PORT":   validatorPORT,
-									"PUBKEY": validatorKEY,
-								}
-								validators[validatorKEY] = getKeyBalance(validatorKEY)
-								io.WriteString(conn, "VALIDATOR_REGISTERED\n")
-							}
-						}
+					validatorsList[validatorKEY] = map[string]interface{}{
+						"IP":     validatorIP,
+						"PORT":   validatorPORT,
+						"PUBKEY": validatorKEY,
 					}
+					validators[validatorKEY] = getKeyBalance(validatorKEY)
+					io.WriteString(conn, "VALIDATOR_REGISTERED\n")
+					fmt.Println("Registered validator with public key " + validatorKEY)
 				}
 			} else {
 				io.WriteString(conn, "ERROR::INVALID_COMMAND_ARGUMENTS\n")
 			}
+		} else if strings.Split(temp, "::")[0] == "GET_PUBKEY" {
+			io.WriteString(conn, getPublicFromPrivate(privKey)+"\n")
 		} else {
 			io.WriteString(conn, "ERROR::INVALID_REQUEST\n")
 		}
