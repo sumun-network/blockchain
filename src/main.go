@@ -50,6 +50,8 @@ var validatorsConn = make(map[int]net.Conn)
 var validatorsList = make(map[string]interface{})
 
 var privKey string
+var tcpPort string
+var stype string
 
 func ping() string {
 	return "pong"
@@ -78,55 +80,6 @@ func getConn(addr string, stype string) (net.Conn, error) {
 	return conn, err
 }
 
-func registerNodes(validators interface{}, stype string, tcpPort string, pu string, pk string) {
-	var nvalidators = make(map[string]interface{})
-	for _, v := range validators.(map[string]interface{}) {
-		md, _ := v.(map[string]interface{})
-		fmt.Println(md["IP"].(string) + ":" + md["PORT"].(string))
-		c, err := getConn(md["IP"].(string)+":"+md["PORT"].(string), stype)
-		if err != nil {
-			fmt.Println("Validator ("+md["PUBKEY"].(string)+") offline:", err)
-		} else {
-			fmt.Fprintf(c, "REGISTER_VALIDATOR::0.0.0.0::"+tcpPort+"::"+pu+"::"+signMessage(pu, pk)+"\n")
-			raw, _ := bufio.NewReader(c).ReadString('\n')
-			message := strings.Split(raw, "\n")[0]
-			if message == "VALIDATOR_REGISTERED" {
-				fmt.Fprintf(c, "GET_KNOWN_VALIDATORS\n")
-				raw, _ := bufio.NewReader(c).ReadString('\n')
-				message := strings.Split(raw, "\n")[0]
-				var nv interface{}
-				var tnv = make(map[string]interface{})
-				json.Unmarshal([]byte(message), &nv)
-				for _, v := range nv.(map[string]interface{}) {
-					md, _ := v.(map[string]interface{})
-					keys := make([]string, 0, len(validatorsList))
-					for k := range validatorsList {
-						keys = append(keys, k)
-					}
-					if !contains(keys, md["PUBKEY"].(string)) {
-						validatorsConn[len(validatorsConn)] = c
-						validatorsList[message] = map[string]interface{}{
-							"IP":     md["IP"].(string),
-							"PORT":   md["PORT"].(string),
-							"PUBKEY": message,
-						}
-						tnv[message] = map[string]interface{}{
-							"IP":     md["IP"].(string),
-							"PORT":   md["PORT"].(string),
-							"PUBKEY": message,
-						}
-						um, _ := json.Marshal(nvalidators)
-						json.Unmarshal([]byte(um), &nvalidators)
-					}
-				}
-			}
-		}
-	}
-	if len(nvalidators) > 0 {
-		registerNodes(nvalidators, stype, tcpPort, pu, pk)
-	}
-}
-
 func main() {
 	pu, pk := genKeypair()
 	fmt.Println(pu)
@@ -139,8 +92,8 @@ func main() {
 	if err != nil {
 		log.Fatal(err)
 	}
-	tcpPort := os.Getenv("PORT")
-	stype := os.Getenv("TYPE")
+	tcpPort = os.Getenv("PORT")
+	stype = os.Getenv("TYPE")
 
 	originAddr := "localhost:8080"
 
@@ -165,18 +118,11 @@ func main() {
 					"PUBKEY": message,
 				}
 				fmt.Println("Validator registered with initial node")
-				fmt.Println("Getting validators list")
-				fmt.Fprintf(c, "GET_KNOWN_VALIDATORS\n")
-				raw, _ = bufio.NewReader(c).ReadString('\n')
-				message = strings.Split(raw, "\n")[0]
-				var validators interface{}
-				json.Unmarshal([]byte(message), &validators)
-				registerNodes(validators, stype, tcpPort, pu, pk)
+				fmt.Println("Network propagation is in progress this may take up to an hour")
 			} else {
 				fmt.Println("Error registering validator")
 				return
 			}
-			fmt.Println("Finished registering with peer nodes")
 		}
 
 		// create genesis block
@@ -331,6 +277,28 @@ func getKeyBalance(key string) int {
 	return 1
 }
 
+func propagateNewValidator(text string) {
+	known := validatorsList
+
+	if !strings.Contains(text, "_PROPAGATE") {
+		text = strings.Replace(text, "REGISTER_VALIDATOR", "REGISTER_VALIDATOR_PROPAGATE", -1)
+	}
+	for _, validator := range known {
+		data, _ := validator.(map[string]interface{})
+		conn, err := net.Dial("tcp", data["IP"].(string)+":"+data["PORT"].(string))
+		if err != nil {
+			log.Fatal("Couldnt propagate new validator to validator: "+data["PUBKEY"].(string)+",", err)
+		}
+		fmt.Println("Sending to " + data["IP"].(string) + ":" + data["PORT"].(string) + ": " + text)
+		fmt.Fprintf(conn, text+"\n")
+		raw, _ := bufio.NewReader(conn).ReadString('\n')
+		message := strings.Split(raw, "\n")[0]
+		if message == "VALIDATOR_REGISTERED" {
+			fmt.Println("Forwarded validator registration to " + data["IP"].(string) + ":" + data["PORT"].(string) + ": " + message)
+		}
+	}
+}
+
 func handleConn(conn net.Conn) {
 	defer conn.Close()
 
@@ -349,8 +317,9 @@ func handleConn(conn net.Conn) {
 				return
 			}
 			io.WriteString(conn, string(netData)+"\n")
-		} else if strings.Split(temp, "::")[0] == "REGISTER_VALIDATOR" {
+		} else if strings.Split(temp, "::")[0] == "REGISTER_VALIDATOR" || strings.Split(temp, "::")[0] == "REGISTER_VALIDATOR_PROPAGATE" {
 			if len(strings.Split(temp, "::")) == 5 {
+				validatorREQ := temp
 				validatorIP := strings.Split(temp, "::")[1]
 				validatorPORT := strings.Split(temp, "::")[2]
 				validatorKEY := strings.Split(temp, "::")[3]
@@ -359,14 +328,35 @@ func handleConn(conn net.Conn) {
 				if !verifyMessage(validatorSIGNATURE, validatorKEY, validatorKEY) {
 					io.WriteString(conn, "ERROR::INVALID_SIGNATURE\n")
 				} else {
-					validatorsList[validatorKEY] = map[string]interface{}{
-						"IP":     validatorIP,
-						"PORT":   validatorPORT,
-						"PUBKEY": validatorKEY,
+					alreadyExists := false
+					for _, pubkey := range validatorsList {
+						if pubkey.(map[string]interface{})["PUBKEY"].(string) == validatorKEY {
+							alreadyExists = true
+							break
+						}
 					}
-					validators[validatorKEY] = getKeyBalance(validatorKEY)
-					io.WriteString(conn, "VALIDATOR_REGISTERED\n")
-					fmt.Println("Registered validator with public key " + validatorKEY)
+					if !alreadyExists && validatorKEY != getPublicFromPrivate(privKey) {
+						validatorsList[validatorKEY] = map[string]interface{}{
+							"IP":     validatorIP,
+							"PORT":   validatorPORT,
+							"PUBKEY": validatorKEY,
+						}
+						validators[validatorKEY] = getKeyBalance(validatorKEY)
+						io.WriteString(conn, "VALIDATOR_REGISTERED\n")
+						fmt.Println("Registered validator with public key " + validatorKEY)
+						go propagateNewValidator(string(validatorREQ))
+						if strings.Split(temp, "::")[0] == "REGISTER_VALIDATOR_PROPAGATE" {
+							fmt.Println("Registering with new validator node")
+							conn, err := net.Dial("tcp", validatorIP+":"+validatorPORT)
+							if err != nil {
+								log.Fatal("Couldnt respond to propagated validator: "+validatorKEY+",", err)
+							} else {
+								pu := getPublicFromPrivate(privKey)
+								fmt.Fprintf(conn, "REGISTER_VALIDATOR::0.0.0.0::"+tcpPort+"::"+pu+"::"+signMessage(pu, privKey)+"\n")
+								fmt.Println("Registered with new validator node")
+							}
+						}
+					}
 				}
 			} else {
 				io.WriteString(conn, "ERROR::INVALID_COMMAND_ARGUMENTS\n")
