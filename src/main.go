@@ -12,6 +12,7 @@ import (
 	"math/rand"
 	"net"
 	"os"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -36,6 +37,11 @@ type Block struct {
 var Blockchain []Block
 var tempBlocks []Block
 
+var blockQueue []func()
+var handlingABlock bool
+
+var currentBlockIndex int
+
 // candidateBlocks handles incoming blocks for validation
 var candidateBlocks = make(chan Block)
 
@@ -52,13 +58,19 @@ var validatorsList = make(map[string]interface{})
 var privKey string
 var tcpPort string
 var stype string
+var originAddr string
 
 func ping() string {
 	return "pong"
 }
 
+func genesis() string {
+	return "GENESIS"
+}
+
 var instructions = map[int]interface{}{
-	0: ping,
+	0: genesis,
+	1: ping,
 }
 
 func contains(s []string, str string) bool {
@@ -80,11 +92,36 @@ func getConn(addr string, stype string) (net.Conn, error) {
 	return conn, err
 }
 
+func propagateCommand(text string) {
+	known := validatorsList
+
+	fmt.Println("Propagating command "+strings.Split(text, "::")[0]+" to", len(validatorsList), "nodes")
+
+	for _, validator := range known {
+		data, _ := validator.(map[string]interface{})
+		conn, err := net.Dial("tcp", data["IP"].(string)+":"+data["PORT"].(string))
+		if err != nil {
+			log.Fatal("Couldnt propagate command to validator: "+data["PUBKEY"].(string)+",", err)
+		}
+		fmt.Println("Sending to " + data["IP"].(string) + ":" + data["PORT"].(string))
+		fmt.Fprintf(conn, text+"\n")
+		raw, _ := bufio.NewReader(conn).ReadString('\n')
+		message := strings.Split(raw, "\n")[0]
+		if message != "OK" {
+			fmt.Println(data["IP"].(string) + ":" + data["PORT"].(string) + " responded with string NEQ \"OK\"")
+			fmt.Println(message)
+		}
+	}
+}
+
 func main() {
 	pu, pk := genKeypair()
 	fmt.Println(pu)
 	fmt.Println(getPublicFromPrivate(pk))
 	fmt.Println(pk)
+
+	currentBlockIndex = 0
+	handlingABlock = false
 
 	privKey = pk
 
@@ -95,7 +132,7 @@ func main() {
 	tcpPort = os.Getenv("PORT")
 	stype = os.Getenv("TYPE")
 
-	originAddr := "localhost:8080"
+	originAddr = "localhost:8080"
 
 	c, err := getConn(originAddr, stype)
 
@@ -117,6 +154,17 @@ func main() {
 					"PORT":   strings.Split(originAddr, ":")[1],
 					"PUBKEY": message,
 				}
+				fmt.Fprintf(c, "GET_BLOCKCHAIN\n")
+				raw, _ = bufio.NewReader(c).ReadString('\n')
+				message = strings.Split(raw, "\n")[0]
+				var newbc []Block
+				err := json.Unmarshal([]byte(message), &newbc)
+				if err != nil {
+					log.Println("Error reading blockchain broadcast:", err)
+				} else {
+					Blockchain = newbc
+					//spew.Dump(Blockchain)
+				}
 				fmt.Println("Validator registered with initial node")
 				fmt.Println("Network propagation is in progress this may take up to an hour")
 			} else {
@@ -125,14 +173,25 @@ func main() {
 			}
 		}
 
-		// create genesis block
-		t := time.Now().Unix()
-		genesisBlock := Block{}
-		var result map[string]interface{}
-		json.Unmarshal([]byte("{}"), &result)
-		genesisBlock = Block{0, t, result, calculateBlockHash(genesisBlock), "", ""}
-		spew.Dump(genesisBlock)
-		Blockchain = append(Blockchain, genesisBlock)
+		validators[pu] = getKeyBalance(pu)
+
+		if stype == "origin" {
+			// create genesis block
+			t := time.Now().Unix()
+			genesisBlock := Block{}
+			var result map[string]interface{}
+			json.Unmarshal([]byte(`{
+				"instruction": 0,
+				"data": {
+					"credits": 600000000000
+				}
+			}`), &result)
+			genesisBlock = Block{0, t, result, calculateBlockHash(genesisBlock), "", ""}
+			spew.Dump(genesisBlock)
+			Blockchain = append(Blockchain, genesisBlock)
+			jd, _ := json.Marshal(Blockchain)
+			propagateCommand("PROPAGATE_BLOCKCHAIN::" + string(jd))
+		}
 
 		// start TCP and serve TCP server
 		server, err := net.Listen("tcp", ":"+tcpPort)
@@ -156,6 +215,8 @@ func main() {
 			}
 		}()
 
+		go workThroughQueue()
+
 		for {
 			conn, err := server.Accept()
 			if err != nil {
@@ -169,63 +230,85 @@ func main() {
 // pickWinner creates a lottery pool of validators and chooses the validator who gets to forge a block to the blockchain
 // by random selecting from the pool, weighted by amount of tokens staked
 func pickWinner() {
-	time.Sleep(5 * time.Second)
+	time.Sleep(50 * time.Millisecond)
+
 	mutex.Lock()
 	temp := tempBlocks
 	mutex.Unlock()
 
-	lotteryPool := []string{}
-	if len(temp) > 0 {
+	if len(validators) > 0 {
+		lotteryPool := []string{}
+		if len(temp) > 0 {
+			fmt.Println("Forging a new block with", len(temp), "transactions")
+			lastBlockTime := temp[len(temp)-1].Timestamp
 
-		lastBlockTime := temp[len(temp)-1].Timestamp
-
-		// slightly modified traditional proof of stake algorithm
-		// from all validators who submitted a block, weight them by the number of staked tokens
-		// in traditional proof of stake, validators can participate without submitting a block to be forged
-	OUTER:
-		for _, block := range temp {
-			// if already in lottery pool, skip
-			for _, node := range lotteryPool {
-				if block.Validator == node {
-					continue OUTER
+			// slightly modified traditional proof of stake algorithm
+			// from all validators who submitted a block, weight them by the number of staked tokens
+			// in traditional proof of stake, validators can participate without submitting a block to be forged
+		OUTER:
+			for _, block := range temp {
+				// if already in lottery pool, skip
+				for _, node := range lotteryPool {
+					if block.Validator == node {
+						continue OUTER
+					}
 				}
-			}
 
-			// lock list of validators to prevent data race
-			mutex.Lock()
-			setValidators := validators
-			mutex.Unlock()
-
-			k, ok := setValidators[block.Validator]
-			if ok {
-				for i := 0; i < k; i++ {
-					lotteryPool = append(lotteryPool, block.Validator)
-				}
-			}
-		}
-
-		// randomly pick winner from lottery pool
-		s := rand.NewSource(lastBlockTime)
-		r := rand.New(s)
-		lotteryWinner := lotteryPool[r.Intn(len(lotteryPool))]
-
-		// add block of winner to blockchain and let all the other nodes know
-		for _, block := range temp {
-			if block.Validator == lotteryWinner {
+				// lock list of validators to prevent data race
 				mutex.Lock()
-				Blockchain = append(Blockchain, block)
+				setValidators := validators
 				mutex.Unlock()
-				for _ = range validators {
-					announcements <- "\nwinning validator: " + lotteryWinner + "\n"
+
+				for _, pubkey := range validatorsList {
+					setValidators[pubkey.(map[string]interface{})["PUBKEY"].(string)] = validators[pubkey.(map[string]interface{})["PUBKEY"].(string)]
+					lotteryPool = append(lotteryPool, pubkey.(map[string]interface{})["PUBKEY"].(string))
 				}
-				break
+
+				lotteryPool = append(lotteryPool, getPublicFromPrivate(privKey))
+
+				sort.Strings(lotteryPool)
 			}
+
+			// randomly pick winner from lottery pool
+			s := rand.NewSource(lastBlockTime)
+			r := rand.New(s)
+			lotteryWinner := lotteryPool[r.Intn(len(lotteryPool))]
+
+			if lotteryWinner == getPublicFromPrivate(privKey) {
+				// add block of winner to blockchain and let all the other nodes know
+				for _, block := range temp {
+					block.Validator = lotteryWinner
+					mutex.Lock()
+					Blockchain = append(Blockchain, block)
+					mutex.Unlock()
+					fmt.Println("Forged new block, broadcasting blockchain to network")
+					jd, _ := json.Marshal(block)
+					//go propagateCommand("PROPAGATE_BLOCKCHAIN::" + string(jd))
+					pubKey := getPublicFromPrivate(privKey)
+					bl, _ := json.Marshal(temp)
+					lotteryAddrs := ""
+					for _, addr := range lotteryPool {
+						lotteryAddrs += addr + ","
+					}
+					go propagateCommand("PROPAGATE_NEW_BLOCK::" + string(jd) + "::" + signMessage(pubKey, privKey) + "::" + pubKey + "::" + Blockchain[len(Blockchain)-2].Hash + "::" + string(bl) + "::" + lotteryAddrs)
+				}
+			} else {
+				fmt.Println("Block forged by someone else, broadcasting")
+				jd, _ := json.Marshal(temp)
+				go propagateCommand("PROPAGATE_NEW_BLOCK_UNOWNED::" + string(jd) + "::" + lotteryWinner)
+			}
+
+			handlingABlock = false
+
+			mutex.Lock()
+			tempBlocks = []Block{}
+			mutex.Unlock()
+		}
+	} else {
+		if len(temp) > 0 {
+			fmt.Println("Block failed to be forged, no known validators")
 		}
 	}
-
-	mutex.Lock()
-	tempBlocks = []Block{}
-	mutex.Unlock()
 }
 
 func verifyMessage(sig string, message string, publicKeyStr string) bool {
@@ -277,6 +360,29 @@ func getKeyBalance(key string) int {
 	return 1
 }
 
+func removeQueueItem(slice []func(), s int) []func() {
+	return append(slice[:s], slice[s+1:]...)
+}
+
+func workThroughQueue() {
+	for {
+		time.Sleep(time.Millisecond * 250)
+		if len(blockQueue) > 0 {
+			var index int
+			for _, block := range blockQueue {
+				if !handlingABlock && blockQueue[index] != nil {
+					fmt.Println("Handling block", strconv.Itoa(index)+",", len(blockQueue), "blocks left in queue")
+					handlingABlock = true
+					block()
+					blockQueue = blockQueue[1:]
+					fmt.Println(blockQueue)
+				}
+				index++
+			}
+		}
+	}
+}
+
 func propagateNewValidator(text string) {
 	known := validatorsList
 
@@ -301,6 +407,8 @@ func propagateNewValidator(text string) {
 
 func handleConn(conn net.Conn) {
 	defer conn.Close()
+
+	var validatorKEYStore string
 
 	for {
 		netData, err := bufio.NewReader(conn).ReadString('\n')
@@ -344,6 +452,7 @@ func handleConn(conn net.Conn) {
 						validators[validatorKEY] = getKeyBalance(validatorKEY)
 						io.WriteString(conn, "VALIDATOR_REGISTERED\n")
 						fmt.Println("Registered validator with public key " + validatorKEY)
+						validatorKEYStore = validatorKEY
 						go propagateNewValidator(string(validatorREQ))
 						if strings.Split(temp, "::")[0] == "REGISTER_VALIDATOR_PROPAGATE" {
 							fmt.Println("Registering with new validator node")
@@ -361,6 +470,220 @@ func handleConn(conn net.Conn) {
 			} else {
 				io.WriteString(conn, "ERROR::INVALID_COMMAND_ARGUMENTS\n")
 			}
+		} else if strings.Split(temp, "::")[0] == "PROPAGATE_NEW_BLOCK_UNOWNED" {
+			block := strings.Split(temp, "::")[1]
+			pubkey := strings.Split(temp, "::")[2]
+
+			if getPublicFromPrivate(privKey) == pubkey {
+				var recvBlock []interface{}
+				json.Unmarshal([]byte(block), &recvBlock)
+
+				mutex.Lock()
+				oldLastIndex := Blockchain[len(Blockchain)-1]
+				mutex.Unlock()
+
+				// create newBlock for consideration to be forged
+
+				for _, block := range recvBlock {
+					blockQueue = append(blockQueue, func() {
+						// create newBlock for consideration to be forged
+						oldLastIndex = Blockchain[len(Blockchain)-1]
+						newBlock, err := generateBlock(oldLastIndex, block.(map[string]interface{})["Instruction"].(map[string]interface{}), getPublicFromPrivate(privKey))
+						if err != nil {
+							log.Println(err)
+						}
+						if isBlockValid(newBlock, oldLastIndex) {
+							candidateBlocks <- newBlock
+							fmt.Println("Block added to candidate pool")
+							io.WriteString(conn, "OK\n")
+						} else {
+							fmt.Println("Block is invalid")
+							io.WriteString(conn, "ERROR::BLOCK_INVALID\n")
+						}
+					})
+				}
+			}
+		} else if strings.Split(temp, "::")[0] == "CREATE_TX" {
+			go func() {
+				instruction := strings.Split(temp, "::")[1]
+				pubkey := getPublicFromPrivate(privKey)
+
+				var result map[string]interface{}
+
+				json.Unmarshal([]byte(instruction), &result)
+
+				if len(result) > 0 {
+					// if malicious party tries to mutate the chain with a bad input, delete them as a validator and they lose their staked tokens
+					insts := make([]string, 0, len(instructions))
+					for k := range instructions {
+						insts = append(insts, string(k))
+					}
+
+					if !contains(insts, string(int64(result["instruction"].(float64)))) {
+						log.Printf("validator %v submitted an invalid instruction", pubkey)
+						delete(validators, pubkey)
+						conn.Close()
+					}
+
+					mutex.Lock()
+					oldLastIndex := Blockchain[len(Blockchain)-1]
+					mutex.Unlock()
+
+					blockQueue = append(blockQueue, func() {
+						// create newBlock for consideration to be forged
+						oldLastIndex = Blockchain[len(Blockchain)-1]
+						newBlock, err := generateBlock(oldLastIndex, result, pubkey)
+						if err != nil {
+							log.Println(err)
+						}
+						if isBlockValid(newBlock, oldLastIndex) {
+							candidateBlocks <- newBlock
+							io.WriteString(conn, newBlock.Hash+"\n")
+						}
+					})
+				} else {
+					io.WriteString(conn, "ERROR::INVALID_COMMAND_ARGUMENTS\n")
+				}
+			}()
+		} else if strings.Split(temp, "::")[0] == "PROPAGATE_BLOCKCHAIN" {
+			var newbc []Block
+			err := json.Unmarshal([]byte(strings.Split(temp, "::")[1]), &newbc)
+			if err != nil {
+				log.Println("Error reading blockchain broadcast:", err)
+			} else {
+				if len(newbc) > len(Blockchain) {
+					lotteryPool := []string{}
+
+					lastBlockTime := newbc[len(newbc)-1].Timestamp
+
+					for _, pubkey := range validatorsList {
+						lotteryPool = append(lotteryPool, pubkey.(map[string]interface{})["PUBKEY"].(string))
+					}
+
+					lotteryPool = append(lotteryPool, getPublicFromPrivate(privKey))
+
+					sort.Strings(lotteryPool)
+
+					s := rand.NewSource(lastBlockTime)
+					r := rand.New(s)
+					lotteryWinner := lotteryPool[r.Intn(len(lotteryPool))]
+
+					if getPublicFromPrivate(privKey) == lotteryWinner {
+						Blockchain = newbc
+						//spew.Dump(Blockchain)
+					} else {
+						fmt.Println("PROPAGATE_BLOCKCHAIN command is invalid")
+						propagateCommand("SUSPEND_VALIDATOR_VOTE::" + validatorKEYStore)
+					}
+				} else {
+					log.Println("Received blockchain is not longer than current blockchain")
+				}
+			}
+		} else if strings.Split(temp, "::")[0] == "PROPAGATE_NEW_BLOCK" {
+			var newb map[string]interface{}
+			var newbc []Block
+			err := json.Unmarshal([]byte(strings.Split(temp, "::")[1]), &newb)
+			err = json.Unmarshal([]byte(strings.Split(temp, "::")[len(strings.Split(temp, "::"))-2]), &newbc)
+			vSig := strings.Split(temp, "::")[2]
+			vKey := strings.Split(temp, "::")[3]
+			prevBlockHash := strings.Split(temp, "::")[4]
+			if err != nil {
+				log.Println("Error reading blockchain broadcast:", err)
+				io.WriteString(conn, "ERROR::INVALID_BLOCK\n")
+			} else {
+				if verifyMessage(vSig, vKey, vKey) {
+					currentBlockIndex++
+					block := Block{
+						Index:       int(newb["Index"].(float64)),
+						Timestamp:   int64(newb["Timestamp"].(float64)),
+						Instruction: newb["Instruction"].(map[string]interface{}),
+						Hash:        newb["Hash"].(string),
+						PrevHash:    newb["PrevHash"].(string),
+						Validator:   newb["Validator"].(string),
+					}
+					lotteryPool := []string{}
+
+					lastBlockTime := newbc[len(newbc)-1].Timestamp
+
+					for _, pubkey := range validatorsList {
+						lotteryPool = append(lotteryPool, pubkey.(map[string]interface{})["PUBKEY"].(string))
+					}
+
+					for _, block := range Blockchain {
+						if prevBlockHash == block.Hash {
+							fmt.Println("Referenced block is valid")
+						}
+					}
+
+					//for _, addr := range lotteryPool {
+					//	if strings.Contains(lotteryData, addr) {
+					//		lotteryPool = strings.Split(lotteryData, ",")
+					//	}
+					//}
+
+					lotteryPool = append(lotteryPool, getPublicFromPrivate(privKey))
+
+					sort.Strings(lotteryPool)
+
+					s := rand.NewSource(lastBlockTime)
+					r := rand.New(s)
+					lotteryWinner := lotteryPool[r.Intn(len(lotteryPool))]
+
+					if vKey == lotteryWinner {
+						if isBlockValid(block, Blockchain[len(Blockchain)-1]) {
+							for _, block := range newbc {
+								var found bool
+								found = false
+								for {
+									for _, b := range Blockchain {
+										if b.Hash == block.PrevHash {
+											fmt.Println("Previous block is found")
+											Blockchain = append(Blockchain, block)
+											found = true
+										}
+									}
+									if found {
+										break
+									}
+								}
+								//spew.Dump(Blockchain)
+							}
+							fmt.Println("PROPAGATE_NEW_BLOCK command is valid")
+							io.WriteString(conn, "SUCCESS::BLOCK_ADDED\n")
+						} else {
+							fmt.Println("PROPAGATE_NEW_BLOCK command is invalid")
+							io.WriteString(conn, "ERROR::BLOCK_INVALID\n")
+						}
+					} else {
+						fmt.Println("PROPAGATE_NEW_BLOCK command by " + vKey + " is invalid")
+						io.WriteString(conn, "ERROR::BLOCK_INVALID\n")
+						fmt.Println("Refreshing blockchain from initial block")
+						time.Sleep(time.Second * 5)
+						c, err := getConn(originAddr, stype)
+						if err != nil {
+							log.Println("Error connecting to origin server:", err)
+						} else {
+							fmt.Fprintf(c, "GET_BLOCKCHAIN\n")
+							raw, _ := bufio.NewReader(c).ReadString('\n')
+							message := strings.Split(raw, "\n")[0]
+							var newbc []Block
+							err := json.Unmarshal([]byte(message), &newbc)
+							if err != nil {
+								log.Println("Error reading blockchain broadcast:", err)
+							} else {
+								Blockchain = newbc
+								//spew.Dump(Blockchain)
+							}
+						}
+					}
+				}
+			}
+		} else if strings.Split(temp, "::")[0] == "SUSPEND_VALIDATOR_VOTE" {
+			validatorAddress := strings.Split(temp, "::")[1]
+			fmt.Println("Recv validator suspend vote:", validatorAddress)
+		} else if strings.Split(temp, "::")[0] == "GET_BLOCKCHAIN" {
+			bc, _ := json.Marshal(Blockchain)
+			io.WriteString(conn, string(bc)+"\n")
 		} else if strings.Split(temp, "::")[0] == "GET_PUBKEY" {
 			io.WriteString(conn, getPublicFromPrivate(privKey)+"\n")
 		} else {
@@ -368,31 +691,14 @@ func handleConn(conn net.Conn) {
 		}
 	}
 
-	go func() {
-		for {
-			msg := <-announcements
-			io.WriteString(conn, msg)
-		}
-	}()
+	//go func() {
+	//	for {
+	//		msg := <-announcements
+	//		io.WriteString(conn, msg)
+	//	}
+	//}()
 	// validator address
 	var address string
-
-	// allow user to allocate number of tokens to stake
-	// the greater the number of tokens, the greater chance to forging a new block
-	io.WriteString(conn, "Enter token balance:")
-	scanBalance := bufio.NewScanner(conn)
-	for scanBalance.Scan() {
-		balance, err := strconv.Atoi(scanBalance.Text())
-		if err != nil {
-			log.Printf("%v not a number: %v", scanBalance.Text(), err)
-			return
-		}
-		address, _ = genKeypair()
-		io.WriteString(conn, "Validator address: "+address)
-		validators[address] = balance
-		fmt.Println(validators)
-		break
-	}
 
 	io.WriteString(conn, "\nEnter a new instruction:")
 
@@ -436,27 +742,20 @@ func handleConn(conn net.Conn) {
 			break
 		}
 	}()
-
-	// simulate receiving broadcast
-	for {
-		time.Sleep(30 * time.Second)
-		mutex.Lock()
-		output, err := json.Marshal(Blockchain)
-		mutex.Unlock()
-		if err != nil {
-			log.Fatal(err)
-		}
-		//fmt.Println(output)
-		io.WriteString(conn, string(output)+"\n")
-	}
-
 }
 
 // isBlockValid makes sure block is valid by checking index
 // and comparing the hash of the previous block
 func isBlockValid(newBlock, oldBlock Block) bool {
 	if oldBlock.Index+1 != newBlock.Index {
-		return false
+		fmt.Println(oldBlock.Index, newBlock.Index)
+		if oldBlock.Index == newBlock.Index {
+			newBlock.Index = newBlock.Index + 1
+		} else if oldBlock.Index+1 == newBlock.Index-1 {
+			newBlock.Index = newBlock.Index - 1
+		} else {
+			return false
+		}
 	}
 
 	if oldBlock.Hash != newBlock.PrevHash {
@@ -488,7 +787,7 @@ func calculateHashBin(s string) []byte {
 
 //calculateBlockHash returns the hash of all block information
 func calculateBlockHash(block Block) string {
-	record := string(block.Index) + string(block.Timestamp) + string(fmt.Sprint(block.Instruction)) + block.PrevHash
+	record := string(block.Index) + strconv.Itoa(int(block.Timestamp)) + string(fmt.Sprint(block.Instruction)) + block.PrevHash
 	return calculateHash(record)
 }
 
@@ -497,7 +796,7 @@ func generateBlock(oldBlock Block, Instruction map[string]interface{}, address s
 
 	var newBlock Block
 
-	t := time.Now().Unix()
+	t := time.Now().UTC().UnixNano() / 1e6
 
 	newBlock.Index = oldBlock.Index + 1
 	newBlock.Timestamp = t
