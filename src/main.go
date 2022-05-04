@@ -37,6 +37,12 @@ type Block struct {
 var Blockchain []Block
 var tempBlocks []Block
 
+var pendingBlocks []Block
+
+var startedVoting int64
+var newBlockVote = make(map[string]int)
+var newBlockVoteData = make(map[string][]Block)
+
 var blockQueue []func()
 var handlingABlock bool
 
@@ -120,6 +126,7 @@ func main() {
 	fmt.Println(getPublicFromPrivate(pk))
 	fmt.Println(pk)
 
+	startedVoting = 0
 	currentBlockIndex = 0
 	handlingABlock = false
 
@@ -217,6 +224,8 @@ func main() {
 
 		go workThroughQueue()
 
+		go voter()
+
 		for {
 			conn, err := server.Accept()
 			if err != nil {
@@ -230,8 +239,6 @@ func main() {
 // pickWinner creates a lottery pool of validators and chooses the validator who gets to forge a block to the blockchain
 // by random selecting from the pool, weighted by amount of tokens staked
 func pickWinner() {
-	time.Sleep(50 * time.Millisecond)
-
 	mutex.Lock()
 	temp := tempBlocks
 	mutex.Unlock()
@@ -279,18 +286,19 @@ func pickWinner() {
 				for _, block := range temp {
 					block.Validator = lotteryWinner
 					mutex.Lock()
-					Blockchain = append(Blockchain, block)
+					pendingBlocks = append(pendingBlocks, block)
 					mutex.Unlock()
-					fmt.Println("Forged new block, broadcasting blockchain to network")
-					jd, _ := json.Marshal(block)
+					fmt.Println("Forged new block")
+					//fmt.Println("Forged new block, broadcasting blockchain to network")
+					//jd, _ := json.Marshal(block)
 					//go propagateCommand("PROPAGATE_BLOCKCHAIN::" + string(jd))
-					pubKey := getPublicFromPrivate(privKey)
-					bl, _ := json.Marshal(temp)
-					lotteryAddrs := ""
-					for _, addr := range lotteryPool {
-						lotteryAddrs += addr + ","
-					}
-					go propagateCommand("PROPAGATE_NEW_BLOCK::" + string(jd) + "::" + signMessage(pubKey, privKey) + "::" + pubKey + "::" + Blockchain[len(Blockchain)-2].Hash + "::" + string(bl) + "::" + lotteryAddrs)
+					//pubKey := getPublicFromPrivate(privKey)
+					//bl, _ := json.Marshal(temp)
+					//lotteryAddrs := ""
+					//for _, addr := range lotteryPool {
+					//	lotteryAddrs += addr + ","
+					//}
+					//go propagateCommand("PROPAGATE_NEW_BLOCK::" + string(jd) + "::" + signMessage(pubKey, privKey) + "::" + pubKey + "::" + Blockchain[len(Blockchain)-2].Hash + "::" + string(bl) + "::" + lotteryAddrs)
 				}
 			} else {
 				fmt.Println("Block forged by someone else, broadcasting")
@@ -366,7 +374,6 @@ func removeQueueItem(slice []func(), s int) []func() {
 
 func workThroughQueue() {
 	for {
-		time.Sleep(time.Millisecond * 250)
 		if len(blockQueue) > 0 {
 			var index int
 			for _, block := range blockQueue {
@@ -401,6 +408,50 @@ func propagateNewValidator(text string) {
 		message := strings.Split(raw, "\n")[0]
 		if message == "VALIDATOR_REGISTERED" {
 			fmt.Println("Forwarded validator registration to " + data["IP"].(string) + ":" + data["PORT"].(string) + ": " + message)
+		}
+	}
+}
+
+func voter() {
+	for {
+		time.Sleep(time.Millisecond * 500)
+		if startedVoting != 0 && len(newBlockVote) > 0 && time.Now().Unix()-startedVoting >= 5 {
+			fmt.Println("Voting period has ended, applying vote results")
+			keys := make([]string, 0, len(newBlockVote))
+			for k := range newBlockVote {
+				keys = append(keys, k)
+			}
+			highestVote := 0
+			highestKey := ""
+			for _, pubkey := range keys {
+				if newBlockVote[pubkey] > highestVote {
+					highestVote = newBlockVote[pubkey]
+					highestKey = pubkey
+				}
+			}
+			fmt.Println("Highest voted:", highestKey, "votes:", highestVote)
+			if highestKey != getPublicFromPrivate(privKey) {
+				fmt.Println("Requesting blockchain from highest voted validator")
+				fmt.Println(validatorsList)
+				nbc := newBlockVoteData[highestKey]
+				fmt.Println("Applying blockchain to local blockchain")
+				Blockchain = append(Blockchain, nbc...)
+				fmt.Println("Blockchain applied")
+			} else {
+				Blockchain = append(Blockchain, pendingBlocks...)
+				fmt.Println("Voted for self, ignoring")
+			}
+			startedVoting = 0
+			newBlockVote = make(map[string]int)
+			mutex.Lock()
+			pendingBlocks = []Block{}
+			mutex.Unlock()
+		}
+		if time.Now().Second()%5 == 0 {
+			jd, _ := json.Marshal(pendingBlocks)
+			fmt.Println(string(jd))
+			pubkey := getPublicFromPrivate(privKey)
+			propagateCommand("COMPARE_PENDING_BLOCKCHAIN::" + string(jd) + "::" + signMessage(string(jd), privKey) + "::" + pubkey)
 		}
 	}
 }
@@ -470,6 +521,111 @@ func handleConn(conn net.Conn) {
 			} else {
 				io.WriteString(conn, "ERROR::INVALID_COMMAND_ARGUMENTS\n")
 			}
+		} else if strings.Split(temp, "::")[0] == "PENDING_BLOCKCHAIN_VOTE" {
+			voteWinner := strings.Split(temp, "::")[1]
+			voteSignature := strings.Split(temp, "::")[2]
+			voteKey := strings.Split(temp, "::")[3]
+
+			if verifyMessage(voteSignature, voteKey, voteKey) {
+				alreadyExists := false
+				keys := make([]string, 0, len(newBlockVote))
+				for k := range newBlockVote {
+					keys = append(keys, k)
+				}
+				for _, pubkey := range keys {
+					if pubkey == voteWinner {
+						alreadyExists = true
+					}
+				}
+				if voteKey != getPublicFromPrivate(privKey) {
+					if startedVoting == 0 {
+						startedVoting = time.Now().Unix()
+					}
+					if !alreadyExists {
+						newBlockVote[voteWinner] = 1
+						fmt.Println("Voted for " + voteWinner)
+						io.WriteString(conn, "OK\n")
+					} else {
+						newBlockVote[voteWinner] = newBlockVote[voteWinner] + 1
+						fmt.Println("Voted for " + voteWinner)
+						io.WriteString(conn, "OK\n")
+					}
+				} else {
+					io.WriteString(conn, "ERROR::CANNOT_VOTE_SELF\n")
+				}
+			} else {
+				fmt.Println("Invalid vote from "+voteKey, "(CANNOT VERIFY SIGNATURE)")
+				io.WriteString(conn, "ERROR::INVALID_SIGNATURE\n")
+			}
+		} else if strings.Split(temp, "::")[0] == "COMPARE_PENDING_BLOCKCHAIN" {
+			var pendingBc []Block
+			validatorBlR := strings.Split(temp, "::")[1]
+			validatorSig := strings.Split(temp, "::")[2]
+			validatorPub := strings.Split(temp, "::")[3]
+			err := json.Unmarshal([]byte(validatorBlR), &pendingBc)
+			if err != nil {
+				fmt.Println("Failed to process COMPARE_PENDING_BLOCKCHAIN:", err)
+				io.WriteString(conn, "ERROR::INVALID_COMMAND_ARGUMENTS\n")
+			} else {
+				if len(pendingBc) > 0 {
+					if pendingBc[0].PrevHash == Blockchain[len(Blockchain)-1].Hash {
+						if verifyMessage(validatorSig, validatorBlR, validatorPub) {
+							if len(pendingBc) > len(pendingBlocks) {
+								fmt.Println("Received new pending blockchain")
+								io.WriteString(conn, "OK\n")
+								pk := getPublicFromPrivate(privKey)
+								alreadyExists := false
+								keys := make([]string, 0, len(newBlockVote))
+								for k := range newBlockVote {
+									keys = append(keys, k)
+								}
+								for _, pubkey := range keys {
+									if pubkey == validatorPub {
+										alreadyExists = true
+									}
+								}
+								if validatorPub != getPublicFromPrivate(privKey) {
+									if startedVoting == 0 {
+										startedVoting = time.Now().Unix()
+									}
+									if !alreadyExists {
+										newBlockVote[validatorPub] = 1
+										fmt.Println("Voted for " + validatorPub)
+									} else {
+										newBlockVote[validatorPub] = newBlockVote[validatorPub] + 1
+										fmt.Println("Voted for " + validatorPub)
+									}
+								}
+								newBlockVoteData[validatorPub] = pendingBc
+								propagateCommand("PENDING_BLOCKCHAIN_VOTE::" + validatorPub + "::" + signMessage(pk, privKey) + "::" + pk)
+							} else if len(pendingBc) == len(pendingBlocks) {
+								if pendingBc[len(pendingBc)-1].Timestamp > pendingBlocks[len(pendingBlocks)-1].Timestamp {
+									fmt.Println("Received new pending blockchain")
+									io.WriteString(conn, "OK\n")
+									pk := getPublicFromPrivate(privKey)
+									propagateCommand("PENDING_BLOCKCHAIN_VOTE::" + validatorPub + "::" + signMessage(pk, privKey) + "::" + pk)
+								} else {
+									fmt.Println("Received new pending blockchain, but it is older than the blockchain")
+									io.WriteString(conn, "ERROR::CHAIN_OLDER\n")
+								}
+							} else {
+								fmt.Println("Received new pending blockchain, but it is shorter than the blockchain")
+								io.WriteString(conn, "ERROR::CHAIN_SHORTER\n")
+							}
+						} else {
+							fmt.Println(validatorPub)
+							fmt.Println("Received new pending blockchain, but signature is invalid")
+							io.WriteString(conn, "ERROR::INVALID_SIGNATURE\n")
+						}
+					} else {
+						fmt.Println("Received invalid pending blockchain")
+						io.WriteString(conn, "ERROR::INVALID_FIRST_HASH\n")
+					}
+				} else {
+					fmt.Println("Cannot use a null-length blockchain")
+					io.WriteString(conn, "ERROR::NULL_LENGTH_BLOCKCHAIN\n")
+				}
+			}
 		} else if strings.Split(temp, "::")[0] == "PROPAGATE_NEW_BLOCK_UNOWNED" {
 			block := strings.Split(temp, "::")[1]
 			pubkey := strings.Split(temp, "::")[2]
@@ -529,18 +685,18 @@ func handleConn(conn net.Conn) {
 					oldLastIndex := Blockchain[len(Blockchain)-1]
 					mutex.Unlock()
 
-					blockQueue = append(blockQueue, func() {
-						// create newBlock for consideration to be forged
-						oldLastIndex = Blockchain[len(Blockchain)-1]
-						newBlock, err := generateBlock(oldLastIndex, result, pubkey)
-						if err != nil {
-							log.Println(err)
-						}
-						if isBlockValid(newBlock, oldLastIndex) {
-							candidateBlocks <- newBlock
-							io.WriteString(conn, newBlock.Hash+"\n")
-						}
-					})
+					//blockQueue = append(blockQueue, func() {
+					// create newBlock for consideration to be forged
+					oldLastIndex = Blockchain[len(Blockchain)-1]
+					newBlock, err := generateBlock(oldLastIndex, result, pubkey)
+					if err != nil {
+						log.Println(err)
+					}
+					if isBlockValid(newBlock, oldLastIndex) {
+						candidateBlocks <- newBlock
+						io.WriteString(conn, newBlock.Hash+"\n")
+					}
+					//})
 				} else {
 					io.WriteString(conn, "ERROR::INVALID_COMMAND_ARGUMENTS\n")
 				}
@@ -683,6 +839,9 @@ func handleConn(conn net.Conn) {
 			fmt.Println("Recv validator suspend vote:", validatorAddress)
 		} else if strings.Split(temp, "::")[0] == "GET_BLOCKCHAIN" {
 			bc, _ := json.Marshal(Blockchain)
+			io.WriteString(conn, string(bc)+"\n")
+		} else if strings.Split(temp, "::")[0] == "GET_PENDING_BLOCKCHAIN" {
+			bc, _ := json.Marshal(pendingBlocks)
 			io.WriteString(conn, string(bc)+"\n")
 		} else if strings.Split(temp, "::")[0] == "GET_PUBKEY" {
 			io.WriteString(conn, getPublicFromPrivate(privKey)+"\n")
